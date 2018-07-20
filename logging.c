@@ -25,6 +25,10 @@ void log_level(int level) {
             ostream = stdout;
             strcpy(level_str, "INFO");
             break;
+        case LOG_LDEBUG:
+            ostream = stdout;
+            strcpy(level_str, "DEBUG");
+            break;
         case LOG_LWARN:
             ostream = stdout;
             strcpy(level_str, "WARNING");
@@ -63,4 +67,14 @@ void log_err(const char *filename, int line, const char *format, ...) {
     va_list args;
     va_start(args, format);
     log_va(stderr, format, args);
+}
+
+void log_debug(const char *filename, int line, const char *format, ...) {
+    log_level(LOG_LDEBUG);
+    fprintf(stdout, "<%s:%d> ", filename, line);
+    fflush(stdout);
+
+    va_list args;
+    va_start(args, format);
+    log_va(stdout, format, args);
 }
