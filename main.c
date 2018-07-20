@@ -4,9 +4,11 @@
 #include <libavcodec/avcodec.h>
 #include <libavformat/avformat.h>
 #include <libswscale/swscale.h>
+#include <libavutil/avstring.h>
 
 #include <SDL2/SDL.h>
 
+#define DEBUG
 #include "logging.h"
 
 #define FF_REFRESH_EVENT SDL_USEREVENT
@@ -39,7 +41,7 @@ typedef struct VideoState {
     SDL_mutex       *textureQueueMutex;
     SDL_cond        *textureQueueCond;
 
-    SDL_Thread      *video_tid;
+    SDL_Thread      *decode_tid;
 
     SDL_Renderer    *renderer;
 
@@ -80,11 +82,11 @@ int open_stream_component(VideoState *is, int stream_index) {
 
     if (codecContext->codec_type == AVMEDIA_TYPE_AUDIO) {
         SDL_zero(wanted_spec);
-        wanted_spec.freq = codecContext->sample_rate;
-        wanted_spec.format = AUDIO_F32SYS;
-        wanted_spec.channels = codecContext->channels;
-        wanted_spec.samples = SDL_AUDIO_BUFFER_SIZE;
-        wanted_spec.callback = NULL;
+        wanted_spec.freq        = codecContext->sample_rate;
+        wanted_spec.format      = AUDIO_F32SYS;
+        wanted_spec.channels    = codecContext->channels;
+        wanted_spec.samples     = SDL_AUDIO_BUFFER_SIZE;
+        wanted_spec.callback    = NULL;
 
         dev = SDL_OpenAudioDevice(NULL, 0, &wanted_spec, &spec, 0);
         if (dev == 0) {
@@ -138,87 +140,6 @@ int queue_audio_frame(VideoState *is, AVFrame *frame) {
     return 0;
 }
 
-int decode_packet(VideoState *is, AVPacket *packet,
-                  int (*queue_frame_func)(VideoState*, AVFrame*)) {
-    AVFrame *frame;
-    int response;
-
-    response = avcodec_send_packet(is->audioContext, packet);
-
-    if (response < 0) {
-        LOG_ERR("Error while sending packet to the decoder: %s", av_err2str(response));
-        return -1;
-    }
-
-    frame = av_frame_alloc();
-    if (!frame) {
-        LOG_ERR("Could not allocate memory for frame");
-        return -1;
-    }
-
-    // While there are still audio frames to unpack from the package
-    while (response >= 0) {
-        response = avcodec_receive_frame(is->audioContext, frame);
-
-        // If no more data to be had from the packet
-        if (response == AVERROR(EAGAIN) || response == AVERROR_EOF)
-            break;
-        else if (response < 0) {
-            printf("Something went wrong with the stream, skipping frame: %s\n",
-                   av_err2str(response));
-            continue;
-        }
-
-        //// Add audio data to the audio queue
-        if ((*queue_frame_func)(is, frame) < 0) {
-            LOG_ERR("Could not queue data");
-            return -1;
-        }
-
-        av_frame_unref(frame);
-    }
-
-    return 0;
-}
-
-/*
-int audio_decode_packet(VideoState *is, AVPacket *packet) {
-    AVFrame *frame;
-    int response;
-
-    response = avcodec_send_packet(is->audioContext, packet);
-
-    if (response < 0) {
-        LOG_ERR("Error while sending packet to the audio decoder: %s", av_err2str(response));
-        return -1;
-    }
-
-    // While there are still audio frames to unpack from the package
-    while (response >= 0) {
-        response = avcodec_receive_frame(is->audioContext, frame);
-
-        // If no more data to be had from the packet
-        if (response == AVERROR(EAGAIN) || response == AVERROR_EOF)
-            break;
-        else if (response < 0) {
-            printf("Something went wrong with the audio stream, skipping frame: %s\n",
-                   av_err2str(response));
-            continue;
-        }
-
-        //// Add audio data to the audio queue
-        if (queue_audio_frame(is, frame) < 0) {
-            LOG_ERR("Could not queue audio data");
-            return -1;
-        }
-
-        av_frame_unref(frame);
-    }
-
-    return 0;
-}
-*/
-
 int queue_video_frame(VideoState *is, AVFrame *frame) {
     SDL_Texture *texture;
     SDL_Rect    rect;
@@ -267,32 +188,54 @@ int queue_video_frame(VideoState *is, AVFrame *frame) {
     return 0;
 }
 
-/*
-int video_decode_packet(VideoState *is, AVPacket *packet) {
-    AVFrame     *frame;
-    int         response;
+int decode_packet_and_queue(VideoState *is, AVPacket *packet) {
+    int (*queue_frame_func)(VideoState*, AVFrame*);
+    AVCodecContext *context;
+    AVFrame *frame;
+    int response;
 
-    response = avcodec_send_packet(is->videoContext, packet);
 
-    if (response < 0) {
-        LOG_ERR("Error while sending packet to the video decoder: %s", av_err2str(response));
+    if (packet->stream_index == is->audio_stream_index) {
+        context = is->audioContext;
+        queue_frame_func = queue_audio_frame;
+    } else if (packet->stream_index == is->video_stream_index) {
+        context = is->videoContext;
+        queue_frame_func = queue_video_frame;
+    } else {
+        // Wut?
+        LOG_ERR("Unknown stream index: %d", packet->stream_index);
         return -1;
     }
 
-    while (response >= 0) {
-        response = avcodec_receive_frame(is->videoContext, frame);
+    response = avcodec_send_packet(context, packet);
+    if (response < 0) {
+        LOG_ERR("Error while sending packet to the decoder: %s - %s", context->codec->name, av_err2str(response));
+        LOG_DEBUG("Codec %s, ID, %d, bit_rate %ld", context->codec->long_name, context->codec->id, context->bit_rate);
+        return -1;
+    }
 
+    frame = av_frame_alloc();
+    if (!frame) {
+        LOG_ERR("Could not allocate memory for frame");
+        return -1;
+    }
+
+    // While there are still audio frames to unpack from the package
+    while (response >= 0) {
+        response = avcodec_receive_frame(is->audioContext, frame);
+
+        // If no more data to be had from the packet
         if (response == AVERROR(EAGAIN) || response == AVERROR_EOF)
             break;
         else if (response < 0) {
-            printf("Something went wrong with the video stream, skipping frame: %s\n",
-                   av_err2str(response));
+            printf("Something went wrong with the stream, skipping frame: %s - %s\n",
+                   context->codec->name, av_err2str(response));
             continue;
         }
 
-        //// Add video data to the video queue
-        if (queue_video_frame(is, frame) < 0) {
-            LOG_ERR("Could not queue video frame");
+        //// Add audio data to the audio queue
+        if ((*queue_frame_func)(is, frame) < 0) {
+            LOG_ERR("Could not queue data");
             return -1;
         }
 
@@ -301,7 +244,6 @@ int video_decode_packet(VideoState *is, AVPacket *packet) {
 
     return 0;
 }
-*/
 
 int decode_thread(void *args) {
     VideoState      *is = (VideoState *)args;
@@ -371,14 +313,7 @@ int decode_thread(void *args) {
             }
         }
 
-        if (packet->stream_index == is->video_stream_index) {
-            // Video packet
-            decode_packet(is, packet, queue_video_frame);
-        } else if (packet->stream_index == is->audio_stream_index) {
-            // Audio packet
-            /* audio_decode_packet(is, packet); */
-            decode_packet(is, packet, queue_audio_frame);
-        }
+        decode_packet_and_queue(is, packet);
     }
 
 
@@ -394,10 +329,63 @@ fail:
     return 0;
 }
 
+void video_display(VideoState *is) {
+    SDL_Rect    rect;
+    SDL_Texture *texture;
+
+    texture = is->textureQueue[is->textureQueue_rindex];
+
+    // TODO: Stuff for aspect ratio and scaling
+    rect.x = 0;
+    rect.y = 0;
+    rect.w = is->videoContext->width;
+    rect.h = is->videoContext->height;
+
+    SDL_RenderCopy(is->renderer, texture, NULL, &rect);
+    SDL_RenderPresent(is->renderer);
+}
+
+static Uint32 sdl_refresh_timer_cb(Uint32 interval, void *arg) {
+    SDL_Event event;
+    event.type = FF_REFRESH_EVENT;
+    event.user.data1 = arg;
+    SDL_PushEvent(&event);
+    return 0;
+}
+
+static void schedule_refresh (VideoState *is, int delay) {
+    SDL_AddTimer(delay, sdl_refresh_timer_cb, is);
+}
+
+void video_refresh_timer(void *userdata) {
+    VideoState  *is = (VideoState *)userdata;
+
+    if (is->videoStream) {
+        if (is->textureQueue_size == 0) {
+            schedule_refresh(is, 1);
+        } else {
+            schedule_refresh(is, 80);
+
+            video_display(is);
+
+            if (++is->textureQueue_rindex == TEXTURE_QUEUE_SIZE) {
+                is->textureQueue_rindex = 0;
+            }
+
+            SDL_LockMutex(is->textureQueueMutex);
+            is->textureQueue_size--;
+            SDL_CondSignal(is->textureQueueCond);
+            SDL_LockMutex(is->textureQueueMutex);
+        }
+    } else {
+        schedule_refresh(is, 100);
+    }
+}
 
 int main(int argc, char *argv[]) {
-    VideoState          *is = NULL;
-    SDL_Window          *window;
+    VideoState  *is = NULL;
+    SDL_Window  *window;
+    SDL_Event   event;
 
 
     is = av_mallocz(sizeof(VideoState));
@@ -422,8 +410,10 @@ int main(int argc, char *argv[]) {
     window = SDL_CreateWindow("Player",
                               SDL_WINDOWPOS_UNDEFINED,
                               SDL_WINDOWPOS_UNDEFINED,
-                              is->videoContext->width,
-                              is->videoContext->height,
+                              /* is->videoContext->width, */
+                              /* is->videoContext->height, */
+                              1920,
+                              1080,
                               SDL_WINDOW_SHOWN);
     if (!window) {
         LOG_ERR("SDL: Could not create window");
@@ -436,9 +426,38 @@ int main(int argc, char *argv[]) {
         LOG_ERR("SDL: Could not create renderer");
         return -1;
     }
-
     SDL_SetRenderDrawColor(is->renderer, 255, 0, 0, 255);
     SDL_RenderClear(is->renderer);
+
+    av_strlcpy(is->url, argv[1], sizeof(is->url));
+
+    is->textureQueueMutex = SDL_CreateMutex();
+    is->textureQueueCond = SDL_CreateCond();
+
+    schedule_refresh(is, 40);
+
+    is->decode_tid = SDL_CreateThread(decode_thread, "DecodeThread", is);
+    if (!is->decode_tid) {
+        LOG_ERR("Could not start Decode Thread");
+        av_free(is);
+        return -1;
+    }
+
+    for (;;) {
+        SDL_WaitEvent(&event);
+        switch(event.type) {
+            case FF_QUIT_EVENT:
+            case SDL_QUIT:
+                is->quit = 1;
+                SDL_Quit();
+                return 0;
+                break;
+            case FF_REFRESH_EVENT:
+                video_refresh_timer(event.user.data1);
+            default:
+                break;
+        }
+    }
 
     av_free(is);
 
