@@ -7,6 +7,8 @@
 
 #include <SDL2/SDL.h>
 
+#include "logging.h"
+
 #define SDL_AUDIO_BUFFER_SIZE 1024
 
 
@@ -51,7 +53,7 @@ int main(int argc, char *argv[]) {
 
 
     if (argc < 2) {
-        printf("Usage: %s <video_file>\n", argv[0]);
+        log_info("Usage: %s <video_file>", argv[0]);
         return -1;
     }
 
