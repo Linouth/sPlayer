@@ -209,8 +209,10 @@ int decode_packet_and_queue(VideoState *is, AVPacket *packet) {
 
     response = avcodec_send_packet(context, packet);
     if (response < 0) {
-        LOG_ERR("Error while sending packet to the decoder: %s - %s", context->codec->name, av_err2str(response));
-        LOG_DEBUG("Codec %s, ID, %d, bit_rate %ld", context->codec->long_name, context->codec->id, context->bit_rate);
+        LOG_ERR("Error while sending packet to the decoder: %s - %s", context->codec->name,
+                av_err2str(response));
+        LOG_DEBUG("Codec %s, ID, %d, bit_rate %ld", context->codec->long_name,
+                  context->codec->id, context->bit_rate);
         return -1;
     }
 
@@ -220,7 +222,7 @@ int decode_packet_and_queue(VideoState *is, AVPacket *packet) {
         return -1;
     }
 
-    // While there are still audio frames to unpack from the package
+    // While there are still frames to unpack from the packet
     while (response >= 0) {
         response = avcodec_receive_frame(is->audioContext, frame);
 
@@ -233,14 +235,14 @@ int decode_packet_and_queue(VideoState *is, AVPacket *packet) {
             continue;
         }
 
-        //// Add audio data to the audio queue
+        // Add data to the designated queue
         if ((*queue_frame_func)(is, frame) < 0) {
             LOG_ERR("Could not queue data");
             return -1;
         }
 
-        av_frame_unref(frame);
     }
+    av_frame_unref(frame);
 
     return 0;
 }
