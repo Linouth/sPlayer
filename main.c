@@ -17,10 +17,31 @@
 
 #define TEXTURE_QUEUE_SIZE 1
 #define MAX_AUDIO_QUEUE_SIZE 10000
+#define PACKET_QUEUE_SIZE 1000
 
 #define SDL_AUDIO_BUFFER_SIZE 1024
 #define MAX_URL_SIZE 1024
 
+typedef struct MyAVPacketList {
+    AVPacket pkt;
+    struct MyAVPacketList *next;
+} MyAVPacketList;
+
+typedef struct PacketQueue {
+    MyAVPacketList  *first_pkt, *last_pkt;
+    int             nb_packets;
+    int             quit;
+
+    SDL_mutex       *mutex;
+    SDL_cond        *cond;
+} PacketQueue;
+
+typedef struct Decoder {
+    PacketQueue     *queue;
+    AVCodecContext  *codecContext;
+    SDL_cond        *empty_queue_cond;
+    SDL_Thread      *decoder_tid;
+} Decoder;
 
 typedef struct VideoState {
     AVFormatContext *pFormatContext;
@@ -41,18 +62,209 @@ typedef struct VideoState {
     SDL_mutex       *textureQueueMutex;
     SDL_cond        *textureQueueCond;
 
-    SDL_Thread      *decode_tid;
+    SDL_Thread      *parse_tid;
 
     SDL_Renderer    *renderer;
 
     char            url[MAX_URL_SIZE];
     int             quit;
+
+
+    SDL_Thread      *decode_tid;
+    AVPacket        *packetQueue[PACKET_QUEUE_SIZE];
+    int             packetQueue_size;
+    int             packetQueue_windex;
+    int             packetQueue_rindex;
+    SDL_mutex       *packetQueueMutex;
+    SDL_cond        *packetQueueCond;
+    PacketQueue     audioq;
+    PacketQueue     videoq;
+
+    Decoder         auddec;
+    SDL_cond        *continue_thread_read;
 } VideoState;
 
+int audio_thread(void *arg);
 
 void fatal(char *msg) {
     LOG_ERR(msg);
     exit(-1);
+}
+
+static int packet_queue_put_private(PacketQueue *q, AVPacket *pkt) {
+    MyAVPacketList *pkt1;
+
+    if (q->quit)
+        return -1;
+
+    pkt1 = av_malloc(sizeof(MyAVPacketList));
+    if (!pkt1)
+        return -1;
+    pkt1->pkt = *pkt;
+    pkt1->next = NULL;
+
+    if (!q->last_pkt)
+        q->first_pkt = pkt1;
+    else
+        q->last_pkt->next = pkt1;
+    q->last_pkt = pkt1;
+    q->nb_packets++;
+    SDL_CondSignal(q->cond);
+
+    return 0;
+}
+
+static int packet_queue_put(PacketQueue *q, AVPacket *pkt) {
+    int ret;
+
+    SDL_LockMutex(q->mutex);
+    ret = packet_queue_put_private(q, pkt);
+    SDL_UnlockMutex(q->mutex);
+
+    if (ret < 0)
+        av_packet_unref(pkt);
+
+    return ret;
+
+}
+
+static int packet_queue_init(PacketQueue *q) {
+    memset(q, 0, sizeof(PacketQueue));
+    q->mutex = SDL_CreateMutex();
+    if (!q->mutex) {
+        LOG_ERR("Could not create mutex: %s", SDL_GetError());
+        return -1;
+    }
+
+    q->cond = SDL_CreateCond();
+    if (!q->cond) {
+        LOG_ERR("Could not create cond: %s", SDL_GetError());
+        return -1;
+    }
+    q->quit = 1;
+    
+    return 0;
+}
+
+static void packet_queue_flush(PacketQueue *q) {
+    MyAVPacketList *pkt, *pkt1;
+
+    SDL_LockMutex(q->mutex);
+    for (pkt = q->first_pkt; pkt; pkt = pkt1) {
+        pkt1 = pkt->next;
+        av_packet_unref(&pkt->pkt);
+        av_freep(&pkt);
+    }
+    q->first_pkt = NULL;
+    q->last_pkt = NULL;
+    q->nb_packets = 0;
+    SDL_UnlockMutex(q->mutex);
+}
+
+static void packet_queue_destroy(PacketQueue *q) {
+    packet_queue_flush(q);
+    SDL_DestroyMutex(q->mutex);
+    SDL_DestroyCond(q->cond);
+}
+
+static void packet_queue_start(PacketQueue *q) {
+    SDL_LockMutex(q->mutex);
+    q->quit = 0;
+    SDL_UnlockMutex(q->mutex);
+}
+
+static int packet_queue_get(PacketQueue *q, AVPacket *pkt) {
+    MyAVPacketList *pkt1;
+    int ret;
+
+    SDL_LockMutex(q->mutex);
+
+    for (;;) {
+        if (q->quit) {
+            ret = -1;
+            break;
+        }
+
+        pkt1 = q->first_pkt;
+        if (pkt1) {
+            q->first_pkt = pkt1->next;
+            if (!q->first_pkt)
+                q->last_pkt = NULL;
+            q->nb_packets--;
+            *pkt = pkt1->pkt;
+
+            av_free(pkt1);
+            ret = 1;
+            break;
+        } else {
+            SDL_CondWait(q->cond, q->mutex);
+        }
+    }
+
+    SDL_UnlockMutex(q->mutex);
+    return ret;
+}
+
+static void decoder_init(Decoder *d, AVCodecContext *codecContext, PacketQueue *queue, SDL_cond *empty_queue_cond) {
+    memset(d, 0, sizeof(Decoder));
+    d->codecContext = codecContext;
+    d->queue = queue;
+    d->empty_queue_cond = empty_queue_cond;
+}
+
+static int decoder_start(Decoder *d, int (*fn)(void *), void *arg) {
+    packet_queue_start(d->queue);
+    d->decoder_tid = SDL_CreateThread(fn, "decoder", arg);
+    if (!d->decoder_tid) {
+        LOG_ERR("Could not create decoding thread: %s", SDL_GetError());
+        return -1;
+    }
+    return 0;
+}
+
+static void decoder_destroy(Decoder *d) {
+    /* av_packet_unref(&d->pkt); */
+    avcodec_free_context(&d->codecContext);
+}
+
+static int decoder_decode_frame(Decoder *d, AVFrame *frame) {
+    AVCodecContext *context = d->codecContext;
+    AVPacket packet;
+    int response;
+
+    if (d->queue->nb_packets == 0)
+        SDL_CondSignal(d->empty_queue_cond);
+    else {
+        if (packet_queue_get(d->queue, &packet) < 0)
+            return -1;
+    }
+
+    response = avcodec_send_packet(context, &packet);
+    if (response < 0) {
+        LOG_ERR("Error while sending packet to the decoder: %s - %s", context->codec->name,
+                av_err2str(response));
+        LOG_DEBUG("Codec %s, ID, %d, bit_rate %ld", context->codec->long_name,
+                  context->codec->id, context->bit_rate);
+        return -1;
+    }
+
+    // While there are still frames to unpack from the packet
+    while (response >= 0) {
+        response = avcodec_receive_frame(context, frame);
+
+        // If no more data to be had from the packet
+        if (response == AVERROR(EAGAIN) || response == AVERROR_EOF)
+            break;
+        else if (response < 0) {
+            printf("Something went wrong with the stream, skipping frame: %s - %s\n",
+                   context->codec->name, av_err2str(response));
+            continue;
+        }
+
+    }
+    av_packet_unref(&packet);
+
+    return 0;
 }
 
 int open_stream_component(VideoState *is, int stream_index) {
@@ -93,6 +305,10 @@ int open_stream_component(VideoState *is, int stream_index) {
             LOG_ERR("SDL_OpenAudio: %s", SDL_GetError());
             return -1;
         }
+
+        decoder_init(&is->auddec, codecContext, &is->audioq, is->continue_thread_read);
+        if (decoder_start(&is->auddec, audio_thread, is) < 0)
+            return -1;
     }
     if (avcodec_open2(codecContext, codec, NULL) < 0) {
         LOG_ERR("Unsupported codec");
@@ -247,10 +463,38 @@ int decode_packet_and_queue(VideoState *is, AVPacket *packet) {
     return 0;
 }
 
-int decode_thread(void *args) {
-    VideoState      *is = (VideoState *)args;
+/*
+int decode_thread(void *arg) {
+    VideoState  *is = (VideoState *)arg;
+    PacketQueue *q;
+    AVPacket packet;
+
+    q = &is->audioq;
+    for (;;) {
+        if (is->quit)
+            break;
+
+        if (q->nb_packets <= 0) {
+            SDL_CondWaitTimeout(q->cond, q->mutex, 10);
+            continue;
+        }
+
+        packet_queue_get(q, &packet);
+        if (packet.stream_index == 0)
+            continue;
+
+        decode_packet_and_queue(is, &packet);
+    }
+
+    return 0;
+}
+*/
+
+int parse_thread(void *arg) {
+    VideoState      *is = (VideoState *)arg;
     AVFormatContext *pFormatContext;
     AVPacket        *packet;
+    PacketQueue     *q;
 
     int audio_index = -1;
     int video_index = -1;
@@ -258,6 +502,8 @@ int decode_thread(void *args) {
 
     is->audio_stream_index = -1;
     is->video_stream_index = -1;
+
+    packet_queue_start(&is->audioq);
 
     if (avformat_open_input(&pFormatContext, is->url, NULL, NULL) < 0) {
         LOG_ERR("Could not open the file");
@@ -282,19 +528,22 @@ int decode_thread(void *args) {
             audio_index = i;
         else if (pFormatContext->streams[i]->codecpar->codec_type == AVMEDIA_TYPE_VIDEO
                 && video_index < 0)
+
             video_index = i;
     }
     if (audio_index >= 0)
         open_stream_component(is, audio_index);
+        /* printf("AudStream..."); */
     if (video_index >= 0)
-        open_stream_component(is, video_index);
+        /* open_stream_component(is, video_index); */
+        printf("VidStream...");
 
     // Check if both video and audio stream index are set (meaning they are found and opened)
     // TODO: Make it so either are optional (Just an audio or video stream)
-    if (is->audio_stream_index < 0 || is->video_stream_index < 0) {
-        LOG_ERR("Could not open codecs");
-        goto fail;
-    }
+    /* if (is->audio_stream_index < 0 || is->video_stream_index < 0) { */
+    /*     LOG_ERR("Could not open codecs"); */
+    /*     goto fail; */
+    /* } */
 
     for (;;) {
         if (is->quit)
@@ -315,7 +564,31 @@ int decode_thread(void *args) {
             }
         }
 
-        decode_packet_and_queue(is, packet);
+        if (packet->stream_index == audio_index)
+            q = &is->audioq;
+        else
+            continue;
+
+        packet_queue_put(q, packet);
+        /*
+        // Add packet to packet queue
+        SDL_LockMutex(is->packetQueueMutex);
+        while (is->packetQueue_size >= PACKET_QUEUE_SIZE && !is->quit) {
+            SDL_CondWait(is->packetQueueCond, is->packetQueueMutex);
+        }
+        SDL_UnlockMutex(is->packetQueueMutex);
+
+        is->packetQueue[is->packetQueue_windex] = packet;
+
+        if (++is->packetQueue_windex == PACKET_QUEUE_SIZE)
+            is->packetQueue_windex = 0;
+
+        SDL_LockMutex(is->packetQueueMutex);
+        is->packetQueue_size++;
+        SDL_UnlockMutex(is->packetQueueMutex);
+        */
+        
+        /* decode_packet_and_queue(is, packet); */
     }
 
 
@@ -328,6 +601,24 @@ fail:
     }
     
     av_packet_free(&packet);
+    return 0;
+}
+
+int audio_thread(void *arg) {
+    VideoState *is = (VideoState *)arg;
+    Decoder d = is->auddec;
+    AVFrame *frame;
+
+    frame = av_frame_alloc();
+
+    for (;;) {
+        if (is->quit)
+            break;
+
+        decoder_decode_frame(&d, frame);
+        queue_audio_frame(is, frame);
+    }
+
     return 0;
 }
 
@@ -436,14 +727,26 @@ int main(int argc, char *argv[]) {
     is->textureQueueMutex = SDL_CreateMutex();
     is->textureQueueCond = SDL_CreateCond();
 
+    if (packet_queue_init(&is->audioq) < 0) {
+        LOG_ERR("Could not initialize packet queue");
+        return -1;
+    }
+
     schedule_refresh(is, 40);
 
-    is->decode_tid = SDL_CreateThread(decode_thread, "DecodeThread", is);
-    if (!is->decode_tid) {
-        LOG_ERR("Could not start Decode Thread");
+    is->parse_tid = SDL_CreateThread(parse_thread, "ParseThread", is);
+    if (!is->parse_tid) {
+        LOG_ERR("Could not start Parse Thread");
         av_free(is);
         return -1;
     }
+
+    /* is->decode_tid = SDL_CreateThread(decode_thread, "DecodeThread", is); */
+    /* if (!is->decode_tid) { */
+    /*     LOG_ERR("Could not start Decode Thread"); */
+    /*     av_free(is); */
+    /*     return -1; */
+    /* } */
 
     for (;;) {
         SDL_WaitEvent(&event);
