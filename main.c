@@ -14,6 +14,7 @@
 #define FF_REFRESH_EVENT SDL_USEREVENT
 #define FF_QUIT_EVENT (SDL_USEREVENT + 1)
 
+#define QUIT -42
 
 #define TEXTURE_QUEUE_SIZE 1
 #define MAX_AUDIO_QUEUE_SIZE 10000
@@ -22,13 +23,8 @@
 #define SDL_AUDIO_BUFFER_SIZE 1024
 #define MAX_URL_SIZE 1024
 
-typedef struct MyAVPacketList {
-    AVPacket pkt;
-    struct MyAVPacketList *next;
-} MyAVPacketList;
-
 typedef struct PacketQueue {
-    MyAVPacketList  *first_pkt, *last_pkt;
+    AVPacketList  *first_pkt, *last_pkt;
     int             nb_packets;
     int             quit;
 
@@ -91,34 +87,35 @@ void fatal(char *msg) {
     exit(-1);
 }
 
-static int packet_queue_put_private(PacketQueue *q, AVPacket *pkt) {
-    MyAVPacketList *pkt1;
+/**
+ * Add a packet to the packet queue
+ * @param q the queue to add to
+ * @param pkt pointer to the packet to add
+ */
+static int packet_queue_put(PacketQueue *q, AVPacket *pkt) {
+    AVPacketList *pkt_ind;
+    int ret = 0;
 
     if (q->quit)
-        return -1;
-
-    pkt1 = av_malloc(sizeof(MyAVPacketList));
-    if (!pkt1)
-        return -1;
-    pkt1->pkt = *pkt;
-    pkt1->next = NULL;
-
-    if (!q->last_pkt)
-        q->first_pkt = pkt1;
-    else
-        q->last_pkt->next = pkt1;
-    q->last_pkt = pkt1;
-    q->nb_packets++;
-    SDL_CondSignal(q->cond);
-
-    return 0;
-}
-
-static int packet_queue_put(PacketQueue *q, AVPacket *pkt) {
-    int ret;
+        ret = QUIT;
 
     SDL_LockMutex(q->mutex);
-    ret = packet_queue_put_private(q, pkt);
+
+        pkt_ind = av_malloc(sizeof(AVPacketList));
+        if (!pkt_ind)
+            ret = -1;
+        pkt_ind->pkt = *pkt;
+        pkt_ind->next = NULL;
+
+        if (!q->last_pkt)
+            q->first_pkt = pkt_ind;
+        else
+            q->last_pkt->next = pkt_ind;
+
+        q->last_pkt = pkt_ind;
+        q->nb_packets++;
+        SDL_CondSignal(q->cond);
+
     SDL_UnlockMutex(q->mutex);
 
     if (ret < 0)
@@ -128,6 +125,10 @@ static int packet_queue_put(PacketQueue *q, AVPacket *pkt) {
 
 }
 
+/**
+ * Prepare PacketQueue, clear memory and create mutex/cond
+ * @param q pointer to PacketQueue to initialize
+ */
 static int packet_queue_init(PacketQueue *q) {
     memset(q, 0, sizeof(PacketQueue));
     q->mutex = SDL_CreateMutex();
@@ -146,60 +147,78 @@ static int packet_queue_init(PacketQueue *q) {
     return 0;
 }
 
+/**
+ * Flush PacketQueue and free all memory
+ * @param q pointer to PacketQueue to flush
+ */
 static void packet_queue_flush(PacketQueue *q) {
-    MyAVPacketList *pkt, *pkt1;
+    AVPacketList *pkt, *pkt1;
 
     SDL_LockMutex(q->mutex);
-    for (pkt = q->first_pkt; pkt; pkt = pkt1) {
-        pkt1 = pkt->next;
-        av_packet_unref(&pkt->pkt);
-        av_freep(&pkt);
-    }
-    q->first_pkt = NULL;
-    q->last_pkt = NULL;
-    q->nb_packets = 0;
+        for (pkt = q->first_pkt; pkt != NULL; pkt = pkt1) {
+            pkt1 = pkt->next;
+            av_packet_unref(&pkt->pkt);
+            av_freep(&pkt);
+        }
+        q->first_pkt = NULL;
+        q->last_pkt = NULL;
+        q->nb_packets = 0;
     SDL_UnlockMutex(q->mutex);
 }
 
+/**
+ * Destroy PacketQueue by flushing, then destroying mutex/cond
+ * @param q pointer to PacketQueue
+ */
 static void packet_queue_destroy(PacketQueue *q) {
     packet_queue_flush(q);
     SDL_DestroyMutex(q->mutex);
     SDL_DestroyCond(q->cond);
 }
 
+/**
+ * Set quit flag to 0, enabeling the use of the PacketQueue
+ * @param q pointer to PacketQueue
+ */
 static void packet_queue_start(PacketQueue *q) {
     SDL_LockMutex(q->mutex);
     q->quit = 0;
     SDL_UnlockMutex(q->mutex);
 }
 
+/**
+ * Get a packet from the PacketQueue
+ * @param q pointer to PacketQueue
+ * @param pkt pointer to AVPacket to be set
+ */
 static int packet_queue_get(PacketQueue *q, AVPacket *pkt) {
-    MyAVPacketList *pkt1;
+    AVPacketList *pkt1;
     int ret;
 
     SDL_LockMutex(q->mutex);
 
-    for (;;) {
-        if (q->quit) {
-            ret = -1;
-            break;
-        }
+        for (;;) {
+            if (q->quit) {
+                ret = QUIT;
+                break;
+            }
 
-        pkt1 = q->first_pkt;
-        if (pkt1) {
-            q->first_pkt = pkt1->next;
-            if (!q->first_pkt)
-                q->last_pkt = NULL;
-            q->nb_packets--;
-            *pkt = pkt1->pkt;
+            pkt1 = q->first_pkt;
+            if (pkt1) {
+                q->first_pkt = pkt1->next;
+                if (!q->first_pkt)
+                    q->last_pkt = NULL;
+                q->nb_packets--;
+                *pkt = pkt1->pkt;
 
-            av_free(pkt1);
-            ret = 1;
-            break;
-        } else {
-            SDL_CondWait(q->cond, q->mutex);
+                av_free(pkt1);
+                ret = 1;
+                break;
+            } else {
+                // Wait for new packets
+                SDL_CondWait(q->cond, q->mutex);
+            }
         }
-    }
 
     SDL_UnlockMutex(q->mutex);
     return ret;
@@ -622,6 +641,7 @@ int audio_thread(void *arg) {
     return 0;
 }
 
+// TODO: Redo whole video rendering part.
 void video_display(VideoState *is) {
     SDL_Rect    rect;
     SDL_Texture *texture;
