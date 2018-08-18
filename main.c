@@ -16,7 +16,7 @@
 
 #define QUIT -42
 
-#define TEXTURE_QUEUE_SIZE 1
+#define TEXTURE_QUEUE_SIZE 16
 #define MAX_AUDIO_QUEUE_SIZE 10000
 #define PACKET_QUEUE_SIZE 1000
 
@@ -77,10 +77,12 @@ typedef struct VideoState {
     PacketQueue     videoq;
 
     Decoder         auddec;
+    Decoder         viddec;
     SDL_cond        *continue_thread_read;
 } VideoState;
 
 int audio_thread(void *arg);
+int video_thread(void *arg);
 
 void fatal(char *msg) {
     LOG_ERR(msg);
@@ -251,16 +253,22 @@ static int decoder_decode_frame(Decoder *d, AVFrame *frame) {
     AVPacket packet;
     int response;
 
-    if (d->queue->nb_packets == 0)
-        SDL_CondSignal(d->empty_queue_cond);
-    else {
+    if (d->queue->nb_packets == 0) {
+        /* SDL_CondSignal(d->empty_queue_cond); */
+        LOG_WARN("Queue empty!");
+        do {
+            SDL_Delay(10);
+        } while (d->queue->nb_packets == 0);
+        if (packet_queue_get(d->queue, &packet) < 0)
+            return -1;
+    } else {
         if (packet_queue_get(d->queue, &packet) < 0)
             return -1;
     }
 
     response = avcodec_send_packet(context, &packet);
     if (response < 0) {
-        LOG_ERR("Error while sending packet to the decoder: %s - %s", context->codec->name,
+        LOG_ERR("Error while sending packet to the decoder: %d - %s - %s", response, context->codec->name,
                 av_err2str(response));
         LOG_DEBUG("Codec %s, ID, %d, bit_rate %ld", context->codec->long_name,
                   context->codec->id, context->bit_rate);
@@ -324,10 +332,6 @@ int open_stream_component(VideoState *is, int stream_index) {
             LOG_ERR("SDL_OpenAudio: %s", SDL_GetError());
             return -1;
         }
-
-        decoder_init(&is->auddec, codecContext, &is->audioq, is->continue_thread_read);
-        if (decoder_start(&is->auddec, audio_thread, is) < 0)
-            return -1;
     }
     if (avcodec_open2(codecContext, codec, NULL) < 0) {
         LOG_ERR("Unsupported codec");
@@ -340,6 +344,10 @@ int open_stream_component(VideoState *is, int stream_index) {
         is->audioStream         = pFormatContext->streams[stream_index];
         is->audioContext        = codecContext;
         is->audioDevice         = dev;
+
+        decoder_init(&is->auddec, codecContext, &is->audioq, is->continue_thread_read);
+        if (decoder_start(&is->auddec, audio_thread, is) < 0)
+            return -1;
         
         SDL_PauseAudioDevice(dev, 0);
     } else if (codecContext->codec_type == AVMEDIA_TYPE_VIDEO) {
@@ -348,7 +356,9 @@ int open_stream_component(VideoState *is, int stream_index) {
         is->videoStream         = pFormatContext->streams[stream_index];
         is->videoContext        = codecContext;
 
-        /* is ->video_tid          = SDL_CreateThread(video_thread, "VideoThread", is); */
+        decoder_init(&is->viddec, codecContext, &is->videoq, is->continue_thread_read);
+        if (decoder_start(&is->viddec, video_thread, is) < 0)
+            return -1;
     }
 
     return 0;
@@ -376,7 +386,7 @@ int queue_audio_frame(VideoState *is, AVFrame *frame) {
 }
 
 int queue_video_frame(VideoState *is, AVFrame *frame) {
-    SDL_Texture *texture;
+    SDL_Texture **texture;
     SDL_Rect    rect;
 
     SDL_LockMutex(is->textureQueueMutex);
@@ -388,10 +398,10 @@ int queue_video_frame(VideoState *is, AVFrame *frame) {
     if (is->quit)
         return -1;
 
-    texture = is->textureQueue[is->textureQueue_windex];
+    texture = &is->textureQueue[is->textureQueue_windex];
 
     // Create and allocate memory for texture
-    texture = SDL_CreateTexture(is->renderer,
+    *texture = SDL_CreateTexture(is->renderer,
                                 SDL_PIXELFORMAT_YV12,
                                 SDL_TEXTUREACCESS_STATIC, 
                                 is->videoContext->width,
@@ -404,7 +414,7 @@ int queue_video_frame(VideoState *is, AVFrame *frame) {
     rect.h = is->videoContext->height;
 
     // Update texture with YUV converted video frame
-    SDL_UpdateYUVTexture(texture,
+    SDL_UpdateYUVTexture(*texture,
                          &rect,
                          frame->data[0],
                          frame->linesize[0],
@@ -551,11 +561,11 @@ int parse_thread(void *arg) {
             video_index = i;
     }
     if (audio_index >= 0)
-        open_stream_component(is, audio_index);
-        /* printf("AudStream..."); */
+        /* open_stream_component(is, audio_index); */
+        log_info("AudStream...");
     if (video_index >= 0)
-        /* open_stream_component(is, video_index); */
-        printf("VidStream...");
+        open_stream_component(is, video_index);
+        /* printf("VidStream...(Skip for now)"); */
 
     // Check if both video and audio stream index are set (meaning they are found and opened)
     // TODO: Make it so either are optional (Just an audio or video stream)
@@ -564,7 +574,9 @@ int parse_thread(void *arg) {
     /*     goto fail; */
     /* } */
 
+    int res;
     for (;;) {
+        q = NULL;
         if (is->quit)
             break;
 
@@ -574,7 +586,8 @@ int parse_thread(void *arg) {
             continue;
         }
 
-        if (av_read_frame(is->pFormatContext, packet) < 0) {
+        if ((res = av_read_frame(is->pFormatContext, packet)) < 0) {
+            /* LOG_DEBUG("av_read_frame < 0: %s", av_err2str(res)); */
             if (is->pFormatContext->pb->error == 0) {
                 SDL_Delay(100);
                 continue;
@@ -585,10 +598,15 @@ int parse_thread(void *arg) {
 
         if (packet->stream_index == audio_index)
             q = &is->audioq;
-        else
-            continue;
+        else if (packet->stream_index == video_index)
+            q = &is->videoq;
+            // TODO: Skip video for now
+            /* continue; */
 
-        packet_queue_put(q, packet);
+        if (q) {
+            /* LOG_DEBUG("Added Packet, ind: %d, Queue size: %d\n", packet->stream_index, q->nb_packets); */
+            packet_queue_put(q, packet);
+        }
         /*
         // Add packet to packet queue
         SDL_LockMutex(is->packetQueueMutex);
@@ -641,7 +659,26 @@ int audio_thread(void *arg) {
     return 0;
 }
 
+int video_thread(void *arg) {
+    VideoState *is = (VideoState *)arg;
+    Decoder d = is->viddec;
+    AVFrame *frame;
+
+    frame = av_frame_alloc();
+
+    for (;;) {
+        if (is->quit)
+            break;
+
+        decoder_decode_frame(&d, frame);
+        queue_video_frame(is, frame);
+    }
+
+    return 0;
+}
+
 // TODO: Redo whole video rendering part.
+// Probably in different file / module
 void video_display(VideoState *is) {
     SDL_Rect    rect;
     SDL_Texture *texture;
@@ -688,7 +725,7 @@ void video_refresh_timer(void *userdata) {
             SDL_LockMutex(is->textureQueueMutex);
             is->textureQueue_size--;
             SDL_CondSignal(is->textureQueueCond);
-            SDL_LockMutex(is->textureQueueMutex);
+            SDL_UnlockMutex(is->textureQueueMutex);
         }
     } else {
         schedule_refresh(is, 100);
@@ -747,7 +784,7 @@ int main(int argc, char *argv[]) {
     is->textureQueueMutex = SDL_CreateMutex();
     is->textureQueueCond = SDL_CreateCond();
 
-    if (packet_queue_init(&is->audioq) < 0) {
+    if (packet_queue_init(&is->videoq) < 0 || packet_queue_init(&is->audioq) < 0) {
         LOG_ERR("Could not initialize packet queue");
         return -1;
     }
